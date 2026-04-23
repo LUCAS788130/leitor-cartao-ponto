@@ -22,7 +22,6 @@ st.markdown("""
     padding-bottom: 2rem;
     max-width: 96%;
 }
-
 .caixa {
     background: #0f172a;
     border: 1px solid #1e293b;
@@ -30,7 +29,6 @@ st.markdown("""
     padding: 16px;
     margin-bottom: 14px;
 }
-
 .alerta-box {
     background: #3a1010;
     border: 1px solid #7f1d1d;
@@ -39,22 +37,12 @@ st.markdown("""
     padding: 14px 16px;
     margin-bottom: 14px;
 }
-
 .sucesso-box {
     background: #052e16;
     border: 1px solid #166534;
     color: #bbf7d0;
     border-radius: 12px;
     padding: 14px 16px;
-    margin-bottom: 14px;
-}
-
-.info-box {
-    background: #0f172a;
-    border: 1px solid #243041;
-    color: #cbd5e1;
-    border-radius: 12px;
-    padding: 12px 14px;
     margin-bottom: 14px;
 }
 </style>
@@ -73,11 +61,6 @@ COLUNAS_MODELO = [
     "Entrada6", "Saída6",
 ]
 
-COLUNAS_EXIBICAO = COLUNAS_MODELO + ["Status", "Horários sem par"]
-
-# =========================
-# FUNÇÕES OCR E PARSE
-# =========================
 def preprocess_image(pil_img):
     img = np.array(pil_img)
 
@@ -203,9 +186,6 @@ def preparar_df_exportacao(df):
 
     return df
 
-# =========================
-# VALIDAÇÃO
-# =========================
 def obter_horarios_sem_par_row(row):
     problemas = []
 
@@ -227,45 +207,26 @@ def obter_horarios_sem_par_row(row):
 def linha_tem_pendencia(row):
     return len(obter_horarios_sem_par_row(row)) > 0
 
-def assinar_linha(row):
-    partes = []
-    for col in COLUNAS_MODELO:
-        partes.append(str(row.get(col, "")).strip())
-    return "||".join(partes)
-
-def construir_assinaturas_iniciais_pendentes(df_original):
-    assinaturas = set()
-    if df_original.empty:
-        return assinaturas
-
-    for _, row in df_original.iterrows():
-        if linha_tem_pendencia(row):
-            assinaturas.add(assinar_linha(row))
-    return assinaturas
-
 def validar_e_marcar(df_atual, df_original):
     df = preparar_df_exportacao(df_atual).copy()
-    assinaturas_originais_pendentes = construir_assinaturas_iniciais_pendentes(df_original)
 
     status_list = []
     horarios_sem_par_list = []
 
     for _, row in df.iterrows():
         problemas = obter_horarios_sem_par_row(row)
-        assinatura_atual = assinar_linha(row)
 
         if problemas:
             status = "⚠️ Pendente"
             horarios_sem_par = " | ".join(problemas)
         else:
-            # corrigido se a linha atual não tem mais pendência
-            # e existia originalmente uma linha pendente para a mesma data
             data_atual = str(row.get("Data", "")).strip()
             corrigido = False
 
-            if data_atual:
-                for _, row_orig in df_original.iterrows():
-                    if str(row_orig.get("Data", "")).strip() == data_atual and linha_tem_pendencia(row_orig):
+            if data_atual and not df_original.empty:
+                orig_mesma_data = df_original[df_original["Data"].astype(str).str.strip() == data_atual]
+                for _, row_orig in orig_mesma_data.iterrows():
+                    if linha_tem_pendencia(row_orig):
                         corrigido = True
                         break
 
@@ -281,34 +242,27 @@ def validar_e_marcar(df_atual, df_original):
 
 def gerar_relatorio_pendentes(df):
     linhas = []
-
     for _, row in df.iterrows():
         if str(row.get("Status", "")).strip() == "⚠️ Pendente":
             linhas.append({
                 "Data": row.get("Data", ""),
                 "Horários sem par": row.get("Horários sem par", "")
             })
-
     return pd.DataFrame(linhas)
 
 def gerar_relatorio_corrigidos(df):
     linhas = []
-
     for _, row in df.iterrows():
         if str(row.get("Status", "")).strip() == "✅ Corrigido":
             linhas.append({
                 "Data": row.get("Data", ""),
                 "Status": "Corrigido"
             })
-
     return pd.DataFrame(linhas)
 
 def obter_hash_arquivo(file_bytes):
     return hashlib.md5(file_bytes).hexdigest()
 
-# =========================
-# ESTADO
-# =========================
 if "arquivo_hash" not in st.session_state:
     st.session_state.arquivo_hash = None
 
@@ -321,9 +275,6 @@ if "df_base" not in st.session_state:
 if "df_editado" not in st.session_state:
     st.session_state.df_editado = pd.DataFrame(columns=COLUNAS_MODELO)
 
-# =========================
-# UPLOAD
-# =========================
 st.markdown('<div class="caixa">', unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
     "Envie o cartão de ponto",
@@ -347,9 +298,9 @@ if uploaded_file:
         st.session_state.df_base = preparar_df_exportacao(df_lido)
         st.session_state.df_editado = preparar_df_exportacao(df_lido)
 
-    topo1, topo2 = st.columns([1, 1])
+    col1, col2 = st.columns([1, 1])
 
-    with topo1:
+    with col1:
         if st.button("🔄 Reprocessar arquivo", use_container_width=True):
             with st.spinner("Relendo o cartão..."):
                 raw_text = extract_text(file_bytes, uploaded_file.type)
@@ -360,7 +311,7 @@ if uploaded_file:
             st.session_state.df_editado = preparar_df_exportacao(df_lido)
             st.rerun()
 
-    with topo2:
+    with col2:
         csv_data = preparar_df_exportacao(st.session_state.df_editado).to_csv(
             index=False,
             encoding="utf-8-sig"
@@ -413,26 +364,20 @@ if uploaded_file:
         disabled=["Status", "Horários sem par"],
         column_config={
             "Data": st.column_config.TextColumn("Data", width="medium"),
-            "Entrada1": st.column_config.TextColumn("Entrada1"),
-            "Saída1": st.column_config.TextColumn("Saída1"),
-            "Entrada2": st.column_config.TextColumn("Entrada2"),
-            "Saída2": st.column_config.TextColumn("Saída2"),
-            "Entrada3": st.column_config.TextColumn("Entrada3"),
-            "Saída3": st.column_config.TextColumn("Saída3"),
-            "Entrada4": st.column_config.TextColumn("Entrada4"),
-            "Saída4": st.column_config.TextColumn("Saída4"),
-            "Entrada5": st.column_config.TextColumn("Entrada5"),
-            "Saída5": st.column_config.TextColumn("Saída5"),
-            "Entrada6": st.column_config.TextColumn("Entrada6"),
-            "Saída6": st.column_config.TextColumn("Saída6"),
-            "Status": st.column_config.TextColumn("Status", width="medium"),
             "Horários sem par": st.column_config.TextColumn("Horários sem par", width="large"),
+            "Status": st.column_config.TextColumn("Status", width="medium"),
         }
     )
 
-    st.session_state.df_editado = preparar_df_exportacao(pd.DataFrame(edited_df))
+    edited_df = pd.DataFrame(edited_df)
 
-    # recalcula depois da edição
+    if "Status" in edited_df.columns:
+        edited_df = edited_df.drop(columns=["Status"])
+    if "Horários sem par" in edited_df.columns:
+        edited_df = edited_df.drop(columns=["Horários sem par"])
+
+    st.session_state.df_editado = preparar_df_exportacao(edited_df)
+
     df_final = validar_e_marcar(
         st.session_state.df_editado,
         st.session_state.df_base
