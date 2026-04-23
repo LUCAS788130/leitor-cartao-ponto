@@ -1,14 +1,17 @@
 import io
 import re
 import hashlib
+from datetime import datetime
+from typing import List, Tuple
+
+import cv2
 import numpy as np
 import pandas as pd
-import cv2
 import pytesseract
 import streamlit as st
-
 from PIL import Image
 from pdf2image import convert_from_bytes
+
 
 # =========================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -60,7 +63,7 @@ st.title("🕒 Leitor de Cartão de Ponto")
 st.caption("Envie o cartão, revise os dias e horários e exporte no modelo exato.")
 
 # =========================================================
-# COLUNAS DO MODELO EXATO
+# MODELO DE SAÍDA
 # =========================================================
 COLUNAS_MODELO = [
     "Data",
@@ -73,7 +76,6 @@ COLUNAS_MODELO = [
 ]
 
 COLUNAS_AUX = ["Status", "Horários sem par"]
-COLUNAS_EDITOR = COLUNAS_MODELO + COLUNAS_AUX
 
 # =========================================================
 # ESTADO
@@ -90,24 +92,30 @@ if "df_original" not in st.session_state:
 if "df_editado" not in st.session_state:
     st.session_state.df_editado = pd.DataFrame(columns=COLUNAS_MODELO)
 
+
 # =========================================================
 # UTILITÁRIOS
 # =========================================================
 def hash_arquivo(file_bytes: bytes) -> str:
     return hashlib.md5(file_bytes).hexdigest()
 
+
 def normalizar_data(valor: str) -> str:
     valor = str(valor).strip()
     if not valor or valor.lower() == "none":
         return ""
 
-    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d/%m"):
         try:
-            return pd.to_datetime(valor, format=fmt).strftime("%d/%m/%Y")
+            dt = pd.to_datetime(valor, format=fmt)
+            if fmt == "%d/%m":
+                return dt.strftime("%d/%m")
+            return dt.strftime("%d/%m/%Y")
         except ValueError:
             pass
 
     return valor
+
 
 def normalizar_hora(valor: str) -> str:
     valor = str(valor).strip()
@@ -120,91 +128,6 @@ def normalizar_hora(valor: str) -> str:
 
     return valor
 
-def preparar_imagem(pil_img: Image.Image) -> Image.Image:
-    img = np.array(pil_img)
-
-    if len(img.shape) == 2:
-        gray = img
-    else:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    gray = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)[1]
-    return Image.fromarray(gray)
-
-def ocr_imagem(img: Image.Image) -> str:
-    try:
-        return pytesseract.image_to_string(img, lang="por", config="--psm 6")
-    except Exception:
-        return pytesseract.image_to_string(img, config="--psm 6")
-
-def extrair_texto(file_bytes: bytes, file_type: str) -> str:
-    partes = []
-
-    if file_type == "application/pdf":
-        paginas = convert_from_bytes(file_bytes, dpi=150)
-        for pagina in paginas:
-            img = preparar_imagem(pagina)
-            partes.append(ocr_imagem(img))
-    else:
-        imagem = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        img = preparar_imagem(imagem)
-        partes.append(ocr_imagem(img))
-
-    return "\n".join(partes)
-
-def montar_linha(data: str, horarios: list[str]) -> dict:
-    linha = {col: "" for col in COLUNAS_MODELO}
-    linha["Data"] = normalizar_data(data)
-
-    horarios = [normalizar_hora(h) for h in horarios[:12]]
-
-    for i, hora in enumerate(horarios, start=1):
-        par = (i + 1) // 2
-        if i % 2 == 1:
-            linha[f"Entrada{par}"] = hora
-        else:
-            linha[f"Saída{par}"] = hora
-
-    return linha
-
-def parse_cartao(texto: str) -> pd.DataFrame:
-    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
-
-    padrao_data = re.compile(r"\b\d{2}/\d{2}/(?:\d{2}|\d{4})\b")
-    padrao_hora = re.compile(r"\b\d{1,2}:\d{2}\b")
-
-    registros = []
-    data_atual = None
-    horarios_atuais = []
-
-    for linha in linhas:
-        datas = padrao_data.findall(linha)
-        horas = padrao_hora.findall(linha)
-
-        if datas:
-            if data_atual is not None:
-                registros.append(montar_linha(data_atual, horarios_atuais))
-
-            data_atual = datas[0]
-            horarios_atuais = horas.copy()
-        else:
-            if data_atual is not None and horas:
-                horarios_atuais.extend(horas)
-
-    if data_atual is not None:
-        registros.append(montar_linha(data_atual, horarios_atuais))
-
-    if not registros:
-        return pd.DataFrame(columns=COLUNAS_MODELO)
-
-    df = pd.DataFrame(registros)
-
-    for col in COLUNAS_MODELO:
-        if col not in df.columns:
-            df[col] = ""
-
-    return df[COLUNAS_MODELO]
 
 def preparar_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -224,7 +147,286 @@ def preparar_df(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def horarios_sem_par_row(row: pd.Series) -> list[str]:
+
+def montar_linha(data: str, horarios: List[str]) -> dict:
+    linha = {col: "" for col in COLUNAS_MODELO}
+    linha["Data"] = normalizar_data(data)
+
+    horarios = [normalizar_hora(h) for h in horarios[:12]]
+
+    for i, hora in enumerate(horarios, start=1):
+        par = (i + 1) // 2
+        if i % 2 == 1:
+            linha[f"Entrada{par}"] = hora
+        else:
+            linha[f"Saída{par}"] = hora
+
+    return linha
+
+
+def completar_ano_em_ddmm(texto_data: str, ano_ref: str) -> str:
+    texto_data = str(texto_data).strip()
+    if re.fullmatch(r"\d{2}/\d{2}", texto_data) and ano_ref:
+        return f"{texto_data}/{ano_ref}"
+    return texto_data
+
+
+def extrair_ano_referencia(texto: str) -> str:
+    anos = re.findall(r"\b(20\d{2})\b", texto)
+    if anos:
+        return anos[0]
+    return ""
+
+
+def extrair_mes_ano_periodo(texto: str) -> Tuple[str, str]:
+    # tenta pegar um período do tipo 21/07/2024 a 20/08/2024
+    m = re.search(r"(\d{2})/(\d{2})/(\d{4})\s*a\s*(\d{2})/(\d{2})/(\d{4})", texto)
+    if m:
+        return m.group(2), m.group(3)
+    return "", ""
+
+
+# =========================================================
+# PRÉ-PROCESSAMENTO DE IMAGEM
+# =========================================================
+def corrigir_rotacao(pil_img: Image.Image) -> Image.Image:
+    try:
+        osd = pytesseract.image_to_osd(pil_img)
+        m = re.search(r"Rotate: (\d+)", osd)
+        if m:
+            angle = int(m.group(1))
+            if angle == 90:
+                return pil_img.rotate(-90, expand=True)
+            elif angle == 180:
+                return pil_img.rotate(180, expand=True)
+            elif angle == 270:
+                return pil_img.rotate(90, expand=True)
+    except Exception:
+        pass
+    return pil_img
+
+
+def cortar_metade_direita(pil_img: Image.Image) -> Image.Image:
+    largura, altura = pil_img.size
+    return pil_img.crop((largura // 2, 0, largura, altura))
+
+
+def preprocess_image(pil_img: Image.Image) -> Image.Image:
+    img = np.array(pil_img)
+
+    if len(img.shape) == 2:
+        gray = img
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)[1]
+    return Image.fromarray(gray)
+
+
+def ocr_image(img: Image.Image) -> str:
+    try:
+        return pytesseract.image_to_string(img, lang="por", config="--psm 6")
+    except Exception:
+        return pytesseract.image_to_string(img, config="--psm 6")
+
+
+def extract_text(file_bytes: bytes, file_type: str) -> str:
+    partes = []
+
+    if file_type == "application/pdf":
+        paginas = convert_from_bytes(file_bytes, dpi=150)
+        for pagina in paginas:
+            pagina = corrigir_rotacao(pagina)
+
+            # OCR preliminar para detectar contracheque + cartão
+            texto_pre = ocr_image(preprocess_image(pagina))
+            if "CARTÃO DE PONTO" in texto_pre.upper() and (
+                "DEMONSTRATIVO DE PAGAMENTO" in texto_pre.upper() or
+                "SALÁRIO" in texto_pre.upper()
+            ):
+                pagina = cortar_metade_direita(pagina)
+
+            processada = preprocess_image(pagina)
+            partes.append(ocr_image(processada))
+    else:
+        imagem = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        imagem = corrigir_rotacao(imagem)
+
+        texto_pre = ocr_image(preprocess_image(imagem))
+        if "CARTÃO DE PONTO" in texto_pre.upper() and (
+            "DEMONSTRATIVO DE PAGAMENTO" in texto_pre.upper() or
+            "SALÁRIO" in texto_pre.upper()
+        ):
+            imagem = cortar_metade_direita(imagem)
+
+        processada = preprocess_image(imagem)
+        partes.append(ocr_image(processada))
+
+    return "\n".join(partes)
+
+
+# =========================================================
+# PARSERS DOS MODELOS
+# =========================================================
+def parse_modelo_1(texto: str) -> pd.DataFrame:
+    # Modelo com coluna "Marcações", horários simples na mesma linha da data
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    padrao_data = re.compile(r"\d{2}/\d{2}/\d{4}")
+    padrao_hora = re.compile(r"\b\d{2}:\d{2}\b")
+
+    registros = []
+    for linha in linhas:
+        data_match = padrao_data.search(linha)
+        if data_match:
+            data = data_match.group()
+            horarios = padrao_hora.findall(linha)
+            registros.append(montar_linha(data, horarios))
+
+    if not registros:
+        return pd.DataFrame(columns=COLUNAS_MODELO)
+
+    return preparar_df(pd.DataFrame(registros))
+
+
+def parse_modelo_2(texto: str) -> pd.DataFrame:
+    # Modelo com "Marcações" e pares com hífen
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    padrao_data = re.compile(r"\b\d{2}\b")
+    padrao_hora = re.compile(r"\b\d{2}:\d{2}\b")
+
+    registros = []
+    for linha in linhas:
+        if not padrao_data.search(linha):
+            continue
+
+        horas = padrao_hora.findall(linha)
+        if horas:
+            registros.append(montar_linha("", horas))
+        else:
+            registros.append(montar_linha("", []))
+
+    if not registros:
+        return pd.DataFrame(columns=COLUNAS_MODELO)
+
+    return preparar_df(pd.DataFrame(registros))
+
+
+def parse_modelo_3(texto: str) -> pd.DataFrame:
+    # Modelo tabular com Ent.1 / Sai.1 / Ent.2 / Sai.2 ...
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    padrao_data = re.compile(r"\b\d{2}/\d{2}\b")
+    padrao_hora = re.compile(r"\b\d{2}:\d{2}\b")
+
+    ano_ref = extrair_ano_referencia(texto)
+    registros = []
+
+    for linha in linhas:
+        data_match = padrao_data.search(linha)
+        if not data_match:
+            continue
+
+        data = completar_ano_em_ddmm(data_match.group(), ano_ref)
+        horarios = padrao_hora.findall(linha)
+        registros.append(montar_linha(data, horarios))
+
+    if not registros:
+        return pd.DataFrame(columns=COLUNAS_MODELO)
+
+    return preparar_df(pd.DataFrame(registros))
+
+
+def parse_modelo_4(texto: str) -> pd.DataFrame:
+    # Modelo textual com ENTRA / I.INI / I.FIN / SAIDA
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    padrao_data = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
+    padrao_hora = re.compile(r"\b\d{2}:\d{2}\b")
+
+    registros = []
+    for linha in linhas:
+        data_match = padrao_data.search(linha)
+        if not data_match:
+            continue
+
+        data = data_match.group()
+        horarios = padrao_hora.findall(linha)
+        registros.append(montar_linha(data, horarios))
+
+    if not registros:
+        return pd.DataFrame(columns=COLUNAS_MODELO)
+
+    return preparar_df(pd.DataFrame(registros))
+
+
+def parse_modelo_5(texto: str) -> pd.DataFrame:
+    # Modelo de cartão ao lado de contracheque; dia do mês + horários
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    padrao_dia = re.compile(r"^\d{2}$")
+    padrao_hora = re.compile(r"\b\d{2}:\d{2}\b")
+
+    mes_ref, ano_ref = extrair_mes_ano_periodo(texto)
+    registros = []
+
+    for linha in linhas:
+        partes = linha.split()
+        if not partes:
+            continue
+
+        if padrao_dia.match(partes[0]):
+            dia = partes[0]
+            data = f"{dia}/{mes_ref}/{ano_ref}" if mes_ref and ano_ref else dia
+            horarios = padrao_hora.findall(linha)
+            registros.append(montar_linha(data, horarios))
+
+    if not registros:
+        return pd.DataFrame(columns=COLUNAS_MODELO)
+
+    return preparar_df(pd.DataFrame(registros))
+
+
+def detectar_modelo(texto: str) -> str:
+    t = texto.upper()
+
+    if "ENTRA" in t and "I.INI" in t and "I.FIN" in t and "SAIDA" in t:
+        return "modelo_4"
+
+    if "ENT.1" in t and "SAI.1" in t:
+        return "modelo_3"
+
+    if "CARTÃO DE PONTO" in t and "MARCAÇÕES" in t and "TRAB" in t:
+        return "modelo_5"
+
+    if "MARCAÇÕES" in t and "-" in t:
+        return "modelo_2"
+
+    if "MARCAÇÕES" in t:
+        return "modelo_1"
+
+    # fallback genérico por data completa
+    if re.search(r"\b\d{2}/\d{2}/\d{4}\b", texto):
+        return "modelo_4"
+
+    return "modelo_1"
+
+
+def parse_cartao(texto: str) -> pd.DataFrame:
+    modelo = detectar_modelo(texto)
+
+    if modelo == "modelo_4":
+        return parse_modelo_4(texto)
+    if modelo == "modelo_3":
+        return parse_modelo_3(texto)
+    if modelo == "modelo_5":
+        return parse_modelo_5(texto)
+    if modelo == "modelo_2":
+        return parse_modelo_2(texto)
+    return parse_modelo_1(texto)
+
+
+# =========================================================
+# VALIDAÇÃO
+# =========================================================
+def horarios_sem_par_row(row: pd.Series) -> List[str]:
     problemas = []
 
     for i in range(1, 7):
@@ -239,8 +441,10 @@ def horarios_sem_par_row(row: pd.Series) -> list[str]:
 
     return problemas
 
+
 def linha_tem_pendencia(row: pd.Series) -> bool:
     return len(horarios_sem_par_row(row)) > 0
+
 
 def validar_e_marcar(df_atual: pd.DataFrame, df_original: pd.DataFrame) -> pd.DataFrame:
     df = preparar_df(df_atual)
@@ -274,14 +478,17 @@ def validar_e_marcar(df_atual: pd.DataFrame, df_original: pd.DataFrame) -> pd.Da
     df["Horários sem par"] = problemas_txt
     return df
 
+
 def relatorio_pendentes(df_validado: pd.DataFrame) -> pd.DataFrame:
     return df_validado[df_validado["Status"] == "⚠️ Pendente"][["Data", "Horários sem par"]].copy()
+
 
 def relatorio_corrigidos(df_validado: pd.DataFrame) -> pd.DataFrame:
     return df_validado[df_validado["Status"] == "✅ Corrigido"][["Data", "Status"]].copy()
 
+
 # =========================================================
-# UPLOAD
+# INTERFACE
 # =========================================================
 st.markdown('<div class="caixa">', unsafe_allow_html=True)
 arquivo = st.file_uploader(
@@ -289,7 +496,10 @@ arquivo = st.file_uploader(
     type=["pdf", "png", "jpg", "jpeg"],
     help="Aceita PDF, PNG, JPG e JPEG."
 )
-st.markdown('<div class="muted">A grade abaixo permite adicionar e excluir linhas diretamente nela.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="muted">A grade abaixo permite adicionar e excluir linhas diretamente nela.</div>',
+    unsafe_allow_html=True
+)
 st.markdown('</div>', unsafe_allow_html=True)
 
 if arquivo is None:
@@ -306,7 +516,7 @@ try:
 
     if arquivo_novo:
         with st.spinner("Lendo e organizando o cartão..."):
-            texto = extrair_texto(file_bytes, arquivo.type)
+            texto = extract_text(file_bytes, arquivo.type)
             df_lido = parse_cartao(texto)
             df_lido = preparar_df(df_lido)
 
@@ -329,7 +539,7 @@ with col1:
     if st.button("🔄 Reprocessar arquivo", use_container_width=True):
         try:
             with st.spinner("Relendo o cartão..."):
-                texto = extrair_texto(file_bytes, arquivo.type)
+                texto = extract_text(file_bytes, arquivo.type)
                 df_lido = parse_cartao(texto)
                 df_lido = preparar_df(df_lido)
 
@@ -356,7 +566,7 @@ with col2:
     )
 
 with st.expander("Visualizar OCR bruto"):
-    st.text(st.session_state.ocr_bruto[:4000] if st.session_state.ocr_bruto else "")
+    st.text(st.session_state.ocr_bruto[:5000] if st.session_state.ocr_bruto else "")
 
 # =========================================================
 # TABELA PRINCIPAL
