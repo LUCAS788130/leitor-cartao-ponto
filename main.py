@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile
 import pdfplumber, pytesseract
 from PIL import Image
-import io, os
+import io, os, json
 from openai import OpenAI
 
 app = FastAPI()
@@ -23,12 +23,25 @@ async def ler_cartao(file: UploadFile):
     texto = extrair_texto(conteudo, file.filename)
 
     prompt = f"""
-Isto é um cartão de ponto.
-Extraia todas as datas e horários.
-Responda em JSON com:
-data, e1, s1, e2, s2, obs.
+Você está lendo um CARTÃO DE PONTO.
 
-Texto:
+Extraia TODAS as datas e TODAS as batidas de horário.
+
+Responda OBRIGATORIAMENTE neste JSON, exatamente neste formato:
+
+[
+  {{
+    "Data": "dd/mm/aaaa",
+    "Entrada1": "hh:mm",
+    "Saida1": "hh:mm",
+    "Entrada2": "hh:mm",
+    "Saida2": "hh:mm"
+  }}
+]
+
+Se faltar batida, deixe vazio "".
+
+Texto do cartão:
 {texto}
 """
 
@@ -37,4 +50,5 @@ Texto:
         input=prompt
     )
 
-    return resposta.output[0].content[0].text
+    conteudo = resposta.output[0].content[0].text
+    return json.loads(conteudo)
