@@ -20,7 +20,10 @@ def preprocess_image(pil_image):
     return Image.fromarray(gray)
 
 def ocr_image(image):
-    return pytesseract.image_to_string(image, lang="por")
+    try:
+        return pytesseract.image_to_string(image, lang="por")
+    except:
+        return pytesseract.image_to_string(image)
 
 def extract_text(file):
     text = ""
