@@ -15,9 +15,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# =========================
-# ESTILO
-# =========================
 st.markdown("""
 <style>
 .block-container {
@@ -34,23 +31,31 @@ st.markdown("""
     margin-bottom: 14px;
 }
 
-.kpi {
-    background: linear-gradient(135deg, #111827, #0f172a);
-    border: 1px solid #243041;
-    border-radius: 16px;
+.alerta-box {
+    background: #3a1010;
+    border: 1px solid #7f1d1d;
+    color: #fecaca;
+    border-radius: 12px;
     padding: 14px 16px;
-    min-height: 88px;
+    margin-bottom: 14px;
 }
 
-.kpi-titulo {
-    color: #94a3b8;
-    font-size: 0.92rem;
-    margin-bottom: 6px;
+.sucesso-box {
+    background: #052e16;
+    border: 1px solid #166534;
+    color: #bbf7d0;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
 }
 
-.kpi-valor {
-    font-size: 1.6rem;
-    font-weight: 700;
+.info-box {
+    background: #0f172a;
+    border: 1px solid #243041;
+    color: #cbd5e1;
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -68,8 +73,10 @@ COLUNAS_MODELO = [
     "Entrada6", "Saída6",
 ]
 
+COLUNAS_EXIBICAO = COLUNAS_MODELO + ["Status", "Horários sem par"]
+
 # =========================
-# FUNÇÕES
+# FUNÇÕES OCR E PARSE
 # =========================
 def preprocess_image(pil_img):
     img = np.array(pil_img)
@@ -106,6 +113,9 @@ def extract_text(file_bytes, file_type):
 
 def normalizar_data(data_str):
     data_str = str(data_str).strip()
+    if not data_str or data_str.lower() == "none":
+        return ""
+
     for fmt in ("%d/%m/%Y", "%d/%m/%y"):
         try:
             return pd.to_datetime(data_str, format=fmt).strftime("%d/%m/%Y")
@@ -115,8 +125,9 @@ def normalizar_data(data_str):
 
 def normalizar_hora(hora_str):
     hora_str = str(hora_str).strip()
-    if not hora_str:
+    if not hora_str or hora_str.lower() == "none":
         return ""
+
     m = re.match(r"^(\d{1,2}):(\d{2})$", hora_str)
     if m:
         hh = m.group(1).zfill(2)
@@ -178,83 +189,122 @@ def parse_cartao(text):
 
     return df[COLUNAS_MODELO]
 
-def adicionar_linha_vazia(df):
-    nova = pd.DataFrame([{col: "" for col in COLUNAS_MODELO}])
-    return pd.concat([df, nova], ignore_index=True)
-
-def excluir_linhas_por_indice(df, indices):
-    if not indices:
-        return df.copy()
-    return df.drop(index=indices, errors="ignore").reset_index(drop=True)
-
-def validar_pares(df):
+def preparar_df_exportacao(df):
     df = df.copy()
-    inconsistencias = []
-    horarios_sem_par = []
 
-    for _, row in df.iterrows():
-        horarios_problematicos = []
+    for col in COLUNAS_MODELO:
+        if col not in df.columns:
+            df[col] = ""
 
-        for i in range(1, 7):
-            entrada_col = f"Entrada{i}"
-            saida_col = f"Saída{i}"
+    df = df[COLUNAS_MODELO].copy()
 
-            entrada = str(row.get(entrada_col, "")).strip()
-            saida = str(row.get(saida_col, "")).strip()
+    for col in df.columns:
+        df[col] = df[col].fillna("").astype(str).replace("None", "")
 
-            if entrada and not saida:
-                horarios_problematicos.append(f"{entrada_col}: {entrada}")
-
-            if saida and not entrada:
-                horarios_problematicos.append(f"{saida_col}: {saida}")
-
-        inconsistencias.append("Sim" if horarios_problematicos else "")
-        horarios_sem_par.append(" | ".join(horarios_problematicos))
-
-    df["Inconsistência"] = inconsistencias
-    df["Horários sem par"] = horarios_sem_par
     return df
 
-def gerar_relatorio_inconsistencias(df):
+# =========================
+# VALIDAÇÃO
+# =========================
+def obter_horarios_sem_par_row(row):
+    problemas = []
+
+    for i in range(1, 7):
+        entrada_col = f"Entrada{i}"
+        saida_col = f"Saída{i}"
+
+        entrada = str(row.get(entrada_col, "")).strip()
+        saida = str(row.get(saida_col, "")).strip()
+
+        if entrada and not saida:
+            problemas.append(f"{entrada_col}: {entrada}")
+
+        if saida and not entrada:
+            problemas.append(f"{saida_col}: {saida}")
+
+    return problemas
+
+def linha_tem_pendencia(row):
+    return len(obter_horarios_sem_par_row(row)) > 0
+
+def assinar_linha(row):
+    partes = []
+    for col in COLUNAS_MODELO:
+        partes.append(str(row.get(col, "")).strip())
+    return "||".join(partes)
+
+def construir_assinaturas_iniciais_pendentes(df_original):
+    assinaturas = set()
+    if df_original.empty:
+        return assinaturas
+
+    for _, row in df_original.iterrows():
+        if linha_tem_pendencia(row):
+            assinaturas.add(assinar_linha(row))
+    return assinaturas
+
+def validar_e_marcar(df_atual, df_original):
+    df = preparar_df_exportacao(df_atual).copy()
+    assinaturas_originais_pendentes = construir_assinaturas_iniciais_pendentes(df_original)
+
+    status_list = []
+    horarios_sem_par_list = []
+
+    for _, row in df.iterrows():
+        problemas = obter_horarios_sem_par_row(row)
+        assinatura_atual = assinar_linha(row)
+
+        if problemas:
+            status = "⚠️ Pendente"
+            horarios_sem_par = " | ".join(problemas)
+        else:
+            # corrigido se a linha atual não tem mais pendência
+            # e existia originalmente uma linha pendente para a mesma data
+            data_atual = str(row.get("Data", "")).strip()
+            corrigido = False
+
+            if data_atual:
+                for _, row_orig in df_original.iterrows():
+                    if str(row_orig.get("Data", "")).strip() == data_atual and linha_tem_pendencia(row_orig):
+                        corrigido = True
+                        break
+
+            status = "✅ Corrigido" if corrigido else ""
+            horarios_sem_par = ""
+
+        status_list.append(status)
+        horarios_sem_par_list.append(horarios_sem_par)
+
+    df["Status"] = status_list
+    df["Horários sem par"] = horarios_sem_par_list
+    return df
+
+def gerar_relatorio_pendentes(df):
     linhas = []
 
     for _, row in df.iterrows():
-        data = str(row.get("Data", "")).strip()
+        if str(row.get("Status", "")).strip() == "⚠️ Pendente":
+            linhas.append({
+                "Data": row.get("Data", ""),
+                "Horários sem par": row.get("Horários sem par", "")
+            })
 
-        for i in range(1, 7):
-            entrada_col = f"Entrada{i}"
-            saida_col = f"Saída{i}"
+    return pd.DataFrame(linhas)
 
-            entrada = str(row.get(entrada_col, "")).strip()
-            saida = str(row.get(saida_col, "")).strip()
+def gerar_relatorio_corrigidos(df):
+    linhas = []
 
-            if entrada and not saida:
-                linhas.append({
-                    "Data": data,
-                    "Campo": entrada_col,
-                    "Horário sem par": entrada,
-                    "Problema": f"{entrada_col} preenchida sem {saida_col}"
-                })
-
-            if saida and not entrada:
-                linhas.append({
-                    "Data": data,
-                    "Campo": saida_col,
-                    "Horário sem par": saida,
-                    "Problema": f"{saida_col} preenchida sem {entrada_col}"
-                })
+    for _, row in df.iterrows():
+        if str(row.get("Status", "")).strip() == "✅ Corrigido":
+            linhas.append({
+                "Data": row.get("Data", ""),
+                "Status": "Corrigido"
+            })
 
     return pd.DataFrame(linhas)
 
 def obter_hash_arquivo(file_bytes):
     return hashlib.md5(file_bytes).hexdigest()
-
-def preparar_df_exportacao(df):
-    df = df.copy()
-    for col in COLUNAS_MODELO:
-        if col not in df.columns:
-            df[col] = ""
-    return df[COLUNAS_MODELO]
 
 # =========================
 # ESTADO
@@ -270,9 +320,6 @@ if "df_base" not in st.session_state:
 
 if "df_editado" not in st.session_state:
     st.session_state.df_editado = pd.DataFrame(columns=COLUNAS_MODELO)
-
-if "linhas_excluir" not in st.session_state:
-    st.session_state.linhas_excluir = []
 
 # =========================
 # UPLOAD
@@ -297,68 +344,23 @@ if uploaded_file:
 
         st.session_state.arquivo_hash = file_hash
         st.session_state.raw_text = raw_text
-        st.session_state.df_base = df_lido.copy()
-        st.session_state.df_editado = df_lido.copy()
-        st.session_state.linhas_excluir = []
+        st.session_state.df_base = preparar_df_exportacao(df_lido)
+        st.session_state.df_editado = preparar_df_exportacao(df_lido)
 
-    # KPIs
-    df_validado_kpi = validar_pares(st.session_state.df_editado)
-    df_incons_kpi = gerar_relatorio_inconsistencias(st.session_state.df_editado)
+    topo1, topo2 = st.columns([1, 1])
 
-    k1, k2, k3 = st.columns(3)
-    with k1:
-        st.markdown(f"""
-        <div class="kpi">
-            <div class="kpi-titulo">Total de linhas</div>
-            <div class="kpi-valor">{len(df_validado_kpi)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with k2:
-        total_datas = int((df_validado_kpi["Data"].astype(str).str.strip() != "").sum()) if not df_validado_kpi.empty else 0
-        st.markdown(f"""
-        <div class="kpi">
-            <div class="kpi-titulo">Dias identificados</div>
-            <div class="kpi-valor">{total_datas}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with k3:
-        st.markdown(f"""
-        <div class="kpi">
-            <div class="kpi-titulo">Horários sem par</div>
-            <div class="kpi-valor">{len(df_incons_kpi)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Ações
-    a1, a2, a3, a4 = st.columns(4)
-
-    with a1:
-        if st.button("➕ Adicionar linha", use_container_width=True):
-            st.session_state.df_editado = adicionar_linha_vazia(st.session_state.df_editado)
-            st.rerun()
-
-    with a2:
+    with topo1:
         if st.button("🔄 Reprocessar arquivo", use_container_width=True):
             with st.spinner("Relendo o cartão..."):
                 raw_text = extract_text(file_bytes, uploaded_file.type)
                 df_lido = parse_cartao(raw_text)
 
             st.session_state.raw_text = raw_text
-            st.session_state.df_base = df_lido.copy()
-            st.session_state.df_editado = df_lido.copy()
-            st.session_state.linhas_excluir = []
+            st.session_state.df_base = preparar_df_exportacao(df_lido)
+            st.session_state.df_editado = preparar_df_exportacao(df_lido)
             st.rerun()
 
-    with a3:
-        if st.button("🗑️ Excluir linhas marcadas", use_container_width=True):
-            st.session_state.df_editado = excluir_linhas_por_indice(
-                st.session_state.df_editado,
-                st.session_state.linhas_excluir
-            )
-            st.session_state.linhas_excluir = []
-            st.rerun()
-
-    with a4:
+    with topo2:
         csv_data = preparar_df_exportacao(st.session_state.df_editado).to_csv(
             index=False,
             encoding="utf-8-sig"
@@ -377,15 +379,30 @@ if uploaded_file:
 
     st.subheader("Tabela para revisão")
 
-    df_exibicao = validar_pares(st.session_state.df_editado)
-
-    selecao = st.multiselect(
-        "Marque os números das linhas que deseja excluir",
-        options=list(range(len(df_exibicao))),
-        default=st.session_state.linhas_excluir,
-        format_func=lambda x: f"Linha {x + 1} - {df_exibicao.iloc[x]['Data'] if x < len(df_exibicao) else ''}"
+    df_exibicao = validar_e_marcar(
+        st.session_state.df_editado,
+        st.session_state.df_base
     )
-    st.session_state.linhas_excluir = selecao
+
+    pendentes_df = gerar_relatorio_pendentes(df_exibicao)
+    corrigidos_df = gerar_relatorio_corrigidos(df_exibicao)
+
+    if not pendentes_df.empty:
+        st.markdown(
+            f'<div class="alerta-box"><strong>Atenção:</strong> há {len(pendentes_df)} dia(s) com horário sem par.</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            '<div class="sucesso-box"><strong>Ok:</strong> não há horários sem par pendentes.</div>',
+            unsafe_allow_html=True
+        )
+
+    if not corrigidos_df.empty:
+        st.markdown(
+            f'<div class="sucesso-box"><strong>Corrigidos:</strong> {len(corrigidos_df)} dia(s) já foram ajustados.</div>',
+            unsafe_allow_html=True
+        )
 
     edited_df = st.data_editor(
         df_exibicao,
@@ -393,7 +410,7 @@ if uploaded_file:
         use_container_width=True,
         hide_index=True,
         key="editor_cartao_principal",
-        disabled=["Inconsistência", "Horários sem par"],
+        disabled=["Status", "Horários sem par"],
         column_config={
             "Data": st.column_config.TextColumn("Data", width="medium"),
             "Entrada1": st.column_config.TextColumn("Entrada1"),
@@ -408,21 +425,33 @@ if uploaded_file:
             "Saída5": st.column_config.TextColumn("Saída5"),
             "Entrada6": st.column_config.TextColumn("Entrada6"),
             "Saída6": st.column_config.TextColumn("Saída6"),
-            "Inconsistência": st.column_config.TextColumn("Inconsistência", width="small"),
+            "Status": st.column_config.TextColumn("Status", width="medium"),
             "Horários sem par": st.column_config.TextColumn("Horários sem par", width="large"),
         }
     )
 
     st.session_state.df_editado = preparar_df_exportacao(pd.DataFrame(edited_df))
 
-    st.subheader("Validação de horários")
-    df_inconsistencias = gerar_relatorio_inconsistencias(st.session_state.df_editado)
+    # recalcula depois da edição
+    df_final = validar_e_marcar(
+        st.session_state.df_editado,
+        st.session_state.df_base
+    )
 
-    if len(df_inconsistencias) > 0:
-        st.error(f"Foram encontrados {len(df_inconsistencias)} horário(s) sem par.")
-        st.dataframe(df_inconsistencias, use_container_width=True, hide_index=True)
+    pendentes_df = gerar_relatorio_pendentes(df_final)
+    corrigidos_df = gerar_relatorio_corrigidos(df_final)
+
+    st.subheader("Pendências atuais")
+    if not pendentes_df.empty:
+        st.dataframe(pendentes_df, use_container_width=True, hide_index=True)
     else:
-        st.success("Nenhum horário sem par encontrado.")
+        st.success("Nenhum dia com horário sem par pendente.")
+
+    st.subheader("Dias corrigidos")
+    if not corrigidos_df.empty:
+        st.dataframe(corrigidos_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Nenhum dia corrigido até o momento.")
 
 else:
     st.info("Envie um arquivo para iniciar a leitura do cartão.")
