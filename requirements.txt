@@ -1,6 +1,7 @@
 streamlit
+pandas
 pytesseract
 pdf2image
 Pillow
-pandas
-openai
+opencv-python-headless
+numpy
