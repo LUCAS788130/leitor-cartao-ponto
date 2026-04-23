@@ -13,6 +13,10 @@ from PIL import Image
 from pdf2image import convert_from_bytes
 
 
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+
 st.set_page_config(
     page_title="Leitor de Cartão de Ponto",
     page_icon="🕒",
@@ -63,6 +67,10 @@ PALAVRAS_STATUS_SEM_MARCACAO = [
     "ABONO", "FOLGA"
 ]
 
+# =========================================================
+# ESTADO
+# =========================================================
+
 if "arquivo_hash" not in st.session_state:
     st.session_state.arquivo_hash = None
 
@@ -75,6 +83,10 @@ if "modelo_detectado" not in st.session_state:
 if "df_editado" not in st.session_state:
     st.session_state.df_editado = pd.DataFrame(columns=COLUNAS_MODELO)
 
+
+# =========================================================
+# UTILITÁRIOS
+# =========================================================
 
 def hash_arquivo(file_bytes: bytes) -> str:
     return hashlib.md5(file_bytes).hexdigest()
@@ -139,16 +151,29 @@ def preprocess_image(pil_img: Image.Image) -> Image.Image:
 
 def best_rotation_for_image(pil_img: Image.Image) -> Image.Image:
     candidates = []
+
     for angle in [0, 90, 180, 270]:
         img_rot = pil_img.rotate(angle, expand=True)
-        txt = pytesseract.image_to_string(preprocess_image(img_rot), lang="por", config="--psm 6")
+        txt = pytesseract.image_to_string(
+            preprocess_image(img_rot),
+            lang="por",
+            config="--psm 6"
+        )
         score = 0
         score += len(re.findall(r"\b\d{2}/\d{2}/\d{4}\b", txt)) * 5
         score += len(re.findall(r"\b\d{2}:\d{2}\b", txt))
         t = txt.upper()
-        for kw in ["LISTAGEM DE MOVIMENTOS", "CARTAO PONTO", "CARTÃO PONTO", "RELATORIO DO CARTAO DE PONTO", "RELATÓRIO DO CARTÃO DE PONTO"]:
+
+        for kw in [
+            "LISTAGEM DE MOVIMENTOS",
+            "CARTAO PONTO",
+            "CARTÃO PONTO",
+            "RELATORIO DO CARTAO DE PONTO",
+            "RELATÓRIO DO CARTÃO DE PONTO"
+        ]:
             if kw in t:
                 score += 20
+
         candidates.append((score, img_rot))
 
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -158,6 +183,7 @@ def best_rotation_for_image(pil_img: Image.Image) -> Image.Image:
 def images_from_upload(file_bytes: bytes, file_type: str) -> list[Image.Image]:
     if file_type == "application/pdf":
         return convert_from_bytes(file_bytes, dpi=170)
+
     return [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
 
 
@@ -188,11 +214,29 @@ def extract_text_from_pdf_for_detection(file_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
+# =========================================================
+# PARSER: LISTAGEM TEXTUAL
+# =========================================================
+
+def extract_periodo_listagem(raw_text: str):
+    m = re.search(
+        r"PERIODO DE:\s*(\d{2}/\d{2}/\d{4})\s*a\s*(\d{2}/\d{2}/\d{4})",
+        raw_text,
+        flags=re.IGNORECASE
+    )
+    if m:
+        ini = datetime.strptime(m.group(1), "%d/%m/%Y")
+        fim = datetime.strptime(m.group(2), "%d/%m/%Y")
+        return ini, fim
+    return None
+
+
 def parse_text_listagem(raw_text: str) -> pd.DataFrame:
     linhas = [l.rstrip() for l in raw_text.splitlines() if l.strip()]
     padrao_data = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
 
-    registros = []
+    periodo = extract_periodo_listagem(raw_text)
+    mapa_marcacoes = {}
 
     for linha in linhas:
         if not padrao_data.search(linha):
@@ -201,24 +245,55 @@ def parse_text_listagem(raw_text: str) -> pd.DataFrame:
         data = padrao_data.search(linha).group()
         upper = linha.upper()
 
-        # se houver ocorrência tipo FOLGA, mantém o dia vazio
+        if data not in mapa_marcacoes:
+            mapa_marcacoes[data] = []
+
+        # se houver ocorrência tipo FOLGA, mantém o dia sem horários
         if any(p in upper for p in PALAVRAS_STATUS_SEM_MARCACAO):
-            registros.append(montar_linha(data, []))
             continue
 
         # pega só o trecho ANTES de HTRAB / ocorrência
-        corte = re.split(r"\bHTRAB\b|\bQV\b|\bOCORRENCIA\b", linha, maxsplit=1, flags=re.IGNORECASE)[0]
+        corte = re.split(
+            r"\bHTRAB\b|\bQV\b|\bOCORRENCIA\b",
+            linha,
+            maxsplit=1,
+            flags=re.IGNORECASE
+        )[0]
 
         # remove data e dia da semana do começo
-        corte = re.sub(r"^\s*\d{2}/\d{2}/\d{4}\s+[A-ZÁÉÍÓÚÇ]{3}\s*", "", corte, flags=re.IGNORECASE)
+        corte = re.sub(
+            r"^\s*\d{2}/\d{2}/\d{4}\s+[A-ZÁÉÍÓÚÇ]{3}\s*",
+            "",
+            corte,
+            flags=re.IGNORECASE
+        )
 
         horas = re.findall(r"\b\d{2}:\d{2}\b", corte)
 
-        # ESTE É O PONTO PRINCIPAL:
-        # só usa as 4 primeiras marcações reais da linha
+        # só as 4 primeiras marcações reais da linha
         horas = horas[:4]
 
-        registros.append(montar_linha(data, horas))
+        # se a mesma data aparecer mais de uma vez, concatena
+        mapa_marcacoes[data].extend(horas)
+
+    registros = []
+
+    # nunca pular dias
+    if periodo:
+        ini, fim = periodo
+        atual = ini
+        while atual <= fim:
+            data_str = atual.strftime("%d/%m/%Y")
+            horas = mapa_marcacoes.get(data_str, [])
+            registros.append(montar_linha(data_str, horas))
+            atual += timedelta(days=1)
+    else:
+        datas_ordenadas = sorted(
+            mapa_marcacoes.keys(),
+            key=lambda x: datetime.strptime(x, "%d/%m/%Y")
+        )
+        for data_str in datas_ordenadas:
+            registros.append(montar_linha(data_str, mapa_marcacoes[data_str]))
 
     if not registros:
         return pd.DataFrame(columns=COLUNAS_MODELO)
@@ -226,8 +301,16 @@ def parse_text_listagem(raw_text: str) -> pd.DataFrame:
     return preparar_df(pd.DataFrame(registros))
 
 
+# =========================================================
+# PARSER: BMG / CARTÃO PONTO
+# =========================================================
+
 def extract_period_from_bmg_text(text: str):
-    m = re.search(r"PER[ÍI]ODO\s*:?\s*(\d{2}/\d{2}/\d{4})\s*A\s*(\d{2}/\d{2}/\d{4})", text, re.IGNORECASE)
+    m = re.search(
+        r"PER[ÍI]ODO\s*:?\s*(\d{2}/\d{2}/\d{4})\s*A\s*(\d{2}/\d{2}/\d{4})",
+        text,
+        re.IGNORECASE
+    )
     if m:
         ini = datetime.strptime(m.group(1), "%d/%m/%Y")
         fim = datetime.strptime(m.group(2), "%d/%m/%Y")
@@ -255,9 +338,11 @@ def intervalo_datas(inicio: datetime, fim: datetime):
 def extract_bmg_rows_from_text(raw_text: str):
     linhas = [re.sub(r"\s+", " ", l).strip() for l in raw_text.splitlines() if l.strip()]
     rows = []
+
     for linha in linhas:
         if re.match(r"^\d{2}\s+[A-ZÁÉÍÓÚÇ]{3}\s+\d{4}\b", linha.upper()):
             rows.append(linha)
+
     return rows
 
 
@@ -270,6 +355,7 @@ def parse_bmg_row_times(line: str):
     m = re.match(r"^\d{2}\s+[A-ZÁÉÍÓÚÇ]{3}\s+\d{4}\s+(.*)$", line, re.IGNORECASE)
     tail = m.group(1) if m else line
 
+    # bloco principal de marcações
     m_mark = re.match(
         r"^((?:\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})(?:\s*\|\s*(?:\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}))*)",
         tail
@@ -277,6 +363,7 @@ def parse_bmg_row_times(line: str):
     if m_mark:
         return re.findall(r"\b\d{1,2}:\d{2}\b", m_mark.group(1))
 
+    # sábado curto
     m_short = re.match(r"^(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})", tail)
     if m_short:
         return re.findall(r"\b\d{1,2}:\d{2}\b", m_short.group(1))
@@ -292,6 +379,7 @@ def parse_bmg(raw_text: str) -> pd.DataFrame:
         return pd.DataFrame(columns=COLUNAS_MODELO)
 
     registros = []
+
     if period:
         start_date, end_date = period
         expected_days = intervalo_datas(start_date, end_date)
@@ -319,7 +407,11 @@ def parse_bmg(raw_text: str) -> pd.DataFrame:
     return preparar_df(pd.DataFrame(registros))
 
 
-def parse_rotated_report_pages(images: list[Image.Image]) -> tuple[pd.DataFrame, str]:
+# =========================================================
+# PARSER: RELATÓRIO ROTACIONADO
+# =========================================================
+
+def parse_rotated_report_pages(images: list[Image.Image]):
     textos = []
     registros = []
 
@@ -327,7 +419,12 @@ def parse_rotated_report_pages(images: list[Image.Image]) -> tuple[pd.DataFrame,
         img = best_rotation_for_image(page_img)
         w, h = img.size
         img = img.crop((int(w * 0.06), int(h * 0.08), int(w * 0.96), int(h * 0.88)))
-        text = pytesseract.image_to_string(preprocess_image(img), lang="por", config="--psm 6")
+
+        text = pytesseract.image_to_string(
+            preprocess_image(img),
+            lang="por",
+            config="--psm 6"
+        )
         textos.append(text)
 
         linhas = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
@@ -343,6 +440,10 @@ def parse_rotated_report_pages(images: list[Image.Image]) -> tuple[pd.DataFrame,
     df = preparar_df(pd.DataFrame(registros)) if registros else pd.DataFrame(columns=COLUNAS_MODELO)
     return df, "\n".join(textos)
 
+
+# =========================================================
+# PROCESSAMENTO CENTRAL
+# =========================================================
 
 def process_file(file_bytes: bytes, file_type: str):
     images = images_from_upload(file_bytes, file_type)
@@ -362,7 +463,11 @@ def process_file(file_bytes: bytes, file_type: str):
         return model, df, detection_text
 
     if model == "DESCONHECIDO" and images:
-        first_text = pytesseract.image_to_string(preprocess_image(best_rotation_for_image(images[0])), lang="por", config="--psm 6")
+        first_text = pytesseract.image_to_string(
+            preprocess_image(best_rotation_for_image(images[0])),
+            lang="por",
+            config="--psm 6"
+        )
         model = detect_model_from_text(first_text)
         detection_text = first_text
 
@@ -373,7 +478,11 @@ def process_file(file_bytes: bytes, file_type: str):
     if model == "BMG":
         raw_pages = []
         for img in images:
-            text = pytesseract.image_to_string(preprocess_image(best_rotation_for_image(img)), lang="por", config="--psm 6")
+            text = pytesseract.image_to_string(
+                preprocess_image(best_rotation_for_image(img)),
+                lang="por",
+                config="--psm 6"
+            )
             raw_pages.append(text)
         full_text = "\n".join(raw_pages)
         df = parse_bmg(full_text)
@@ -382,7 +491,11 @@ def process_file(file_bytes: bytes, file_type: str):
     if model == "TEXTO_LISTAGEM":
         raw_pages = []
         for img in images:
-            text = pytesseract.image_to_string(preprocess_image(best_rotation_for_image(img)), lang="por", config="--psm 6")
+            text = pytesseract.image_to_string(
+                preprocess_image(best_rotation_for_image(img)),
+                lang="por",
+                config="--psm 6"
+            )
             raw_pages.append(text)
         full_text = "\n".join(raw_pages)
         df = parse_text_listagem(full_text)
@@ -390,13 +503,22 @@ def process_file(file_bytes: bytes, file_type: str):
 
     raw_pages = []
     for img in images:
-        text = pytesseract.image_to_string(preprocess_image(best_rotation_for_image(img)), lang="por", config="--psm 6")
+        text = pytesseract.image_to_string(
+            preprocess_image(best_rotation_for_image(img)),
+            lang="por",
+            config="--psm 6"
+        )
         raw_pages.append(text)
+
     full_text = "\n".join(raw_pages)
 
     df = parse_text_listagem(full_text)
     return "FALLBACK", df, full_text
 
+
+# =========================================================
+# INTERFACE
+# =========================================================
 
 st.markdown('<div class="caixa">', unsafe_allow_html=True)
 arquivo = st.file_uploader(
@@ -405,7 +527,7 @@ arquivo = st.file_uploader(
     help="Aceita PDF, PNG, JPG e JPEG."
 )
 st.markdown(
-    '<div class="muted">Nesta versão, a validação instantânea foi removida para evitar travamentos.</div>',
+    '<div class="muted">Validação instantânea removida para deixar a revisão mais leve.</div>',
     unsafe_allow_html=True
 )
 st.markdown('</div>', unsafe_allow_html=True)
