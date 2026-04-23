@@ -9,8 +9,6 @@ import re
 import hashlib
 import io
 
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-
 st.set_page_config(
     page_title="Leitor de Cartão de Ponto",
     page_icon="🕒",
@@ -23,63 +21,42 @@ st.set_page_config(
 st.markdown("""
 <style>
 .block-container {
-    padding-top: 1.2rem;
+    padding-top: 1rem;
     padding-bottom: 2rem;
     max-width: 96%;
 }
 
-h1, h2, h3 {
-    letter-spacing: -0.3px;
-}
-
-.card {
-    background: #111827;
-    border: 1px solid #1f2937;
-    border-radius: 16px;
-    padding: 18px 18px 14px 18px;
-    margin-bottom: 14px;
-}
-
-.card-light {
+.caixa {
     background: #0f172a;
     border: 1px solid #1e293b;
     border-radius: 16px;
-    padding: 18px;
+    padding: 16px;
     margin-bottom: 14px;
 }
 
-.small-muted {
-    color: #94a3b8;
-    font-size: 0.92rem;
-}
-
 .kpi {
-    background: linear-gradient(135deg, #0f172a, #111827);
+    background: linear-gradient(135deg, #111827, #0f172a);
     border: 1px solid #243041;
     border-radius: 16px;
     padding: 14px 16px;
-    min-height: 90px;
+    min-height: 88px;
 }
 
-.kpi-title {
+.kpi-titulo {
     color: #94a3b8;
-    font-size: 0.9rem;
+    font-size: 0.92rem;
     margin-bottom: 6px;
 }
 
-.kpi-value {
-    font-size: 1.7rem;
+.kpi-valor {
+    font-size: 1.6rem;
     font-weight: 700;
-}
-
-hr {
-    border-color: #1f2937;
 }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🕒 Leitor de Cartão de Ponto")
-st.caption("Converte cartões de ponto para o modelo exato de importação, com revisão manual antes da exportação.")
+st.caption("Leia o cartão, revise os dias e horários, corrija o que for necessário e exporte no modelo exato.")
 
 COLUNAS_MODELO = [
     "Data",
@@ -205,13 +182,17 @@ def adicionar_linha_vazia(df):
     nova = pd.DataFrame([{col: "" for col in COLUNAS_MODELO}])
     return pd.concat([df, nova], ignore_index=True)
 
+def excluir_linhas_por_indice(df, indices):
+    if not indices:
+        return df.copy()
+    return df.drop(index=indices, errors="ignore").reset_index(drop=True)
+
 def validar_pares(df):
     df = df.copy()
     inconsistencias = []
     horarios_sem_par = []
 
     for _, row in df.iterrows():
-        problemas = []
         horarios_problematicos = []
 
         for i in range(1, 7):
@@ -222,15 +203,13 @@ def validar_pares(df):
             saida = str(row.get(saida_col, "")).strip()
 
             if entrada and not saida:
-                problemas.append(f"{entrada_col} sem {saida_col}")
-                horarios_problematicos.append(entrada)
+                horarios_problematicos.append(f"{entrada_col}: {entrada}")
 
             if saida and not entrada:
-                problemas.append(f"{saida_col} sem {entrada_col}")
-                horarios_problematicos.append(saida)
+                horarios_problematicos.append(f"{saida_col}: {saida}")
 
-        inconsistencias.append("Sim" if problemas else "")
-        horarios_sem_par.append(" | ".join(horarios_problematicos) if horarios_problematicos else "")
+        inconsistencias.append("Sim" if horarios_problematicos else "")
+        horarios_sem_par.append(" | ".join(horarios_problematicos))
 
     df["Inconsistência"] = inconsistencias
     df["Horários sem par"] = horarios_sem_par
@@ -270,7 +249,7 @@ def gerar_relatorio_inconsistencias(df):
 def obter_hash_arquivo(file_bytes):
     return hashlib.md5(file_bytes).hexdigest()
 
-def preparar_df_para_exportacao(df):
+def preparar_df_exportacao(df):
     df = df.copy()
     for col in COLUNAS_MODELO:
         if col not in df.columns:
@@ -292,16 +271,18 @@ if "df_base" not in st.session_state:
 if "df_editado" not in st.session_state:
     st.session_state.df_editado = pd.DataFrame(columns=COLUNAS_MODELO)
 
+if "linhas_excluir" not in st.session_state:
+    st.session_state.linhas_excluir = []
+
 # =========================
 # UPLOAD
 # =========================
-st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown('<div class="caixa">', unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
     "Envie o cartão de ponto",
     type=["pdf", "png", "jpg", "jpeg"],
     help="Aceita PDF, JPG, JPEG e PNG."
 )
-st.markdown('<div class="small-muted">O sistema lê o cartão, organiza os dias e horários no modelo exato e permite revisão antes do CSV.</div>', unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
 if uploaded_file:
@@ -318,17 +299,45 @@ if uploaded_file:
         st.session_state.raw_text = raw_text
         st.session_state.df_base = df_lido.copy()
         st.session_state.df_editado = df_lido.copy()
+        st.session_state.linhas_excluir = []
 
-    # =========================
-    # AÇÕES
-    # =========================
-    col_a, col_b, col_c, col_d = st.columns([1, 1, 1, 1])
+    # KPIs
+    df_validado_kpi = validar_pares(st.session_state.df_editado)
+    df_incons_kpi = gerar_relatorio_inconsistencias(st.session_state.df_editado)
 
-    with col_a:
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.markdown(f"""
+        <div class="kpi">
+            <div class="kpi-titulo">Total de linhas</div>
+            <div class="kpi-valor">{len(df_validado_kpi)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with k2:
+        total_datas = int((df_validado_kpi["Data"].astype(str).str.strip() != "").sum()) if not df_validado_kpi.empty else 0
+        st.markdown(f"""
+        <div class="kpi">
+            <div class="kpi-titulo">Dias identificados</div>
+            <div class="kpi-valor">{total_datas}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with k3:
+        st.markdown(f"""
+        <div class="kpi">
+            <div class="kpi-titulo">Horários sem par</div>
+            <div class="kpi-valor">{len(df_incons_kpi)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Ações
+    a1, a2, a3, a4 = st.columns(4)
+
+    with a1:
         if st.button("➕ Adicionar linha", use_container_width=True):
             st.session_state.df_editado = adicionar_linha_vazia(st.session_state.df_editado)
+            st.rerun()
 
-    with col_b:
+    with a2:
         if st.button("🔄 Reprocessar arquivo", use_container_width=True):
             with st.spinner("Relendo o cartão..."):
                 raw_text = extract_text(file_bytes, uploaded_file.type)
@@ -337,16 +346,22 @@ if uploaded_file:
             st.session_state.raw_text = raw_text
             st.session_state.df_base = df_lido.copy()
             st.session_state.df_editado = df_lido.copy()
+            st.session_state.linhas_excluir = []
             st.rerun()
 
-    with col_c:
-        if st.button("🧹 Limpar tabela", use_container_width=True):
-            st.session_state.df_editado = pd.DataFrame(columns=COLUNAS_MODELO)
+    with a3:
+        if st.button("🗑️ Excluir linhas marcadas", use_container_width=True):
+            st.session_state.df_editado = excluir_linhas_por_indice(
+                st.session_state.df_editado,
+                st.session_state.linhas_excluir
+            )
+            st.session_state.linhas_excluir = []
             st.rerun()
 
-    with col_d:
-        csv_data = preparar_df_para_exportacao(st.session_state.df_editado).to_csv(
-            index=False, encoding="utf-8-sig"
+    with a4:
+        csv_data = preparar_df_exportacao(st.session_state.df_editado).to_csv(
+            index=False,
+            encoding="utf-8-sig"
         ).encode("utf-8-sig")
 
         st.download_button(
@@ -357,138 +372,55 @@ if uploaded_file:
             use_container_width=True
         )
 
-    # =========================
-    # KPIS
-    # =========================
-    df_validado = validar_pares(st.session_state.df_editado)
-    df_inconsistencias = gerar_relatorio_inconsistencias(st.session_state.df_editado)
-
-    total_linhas = len(df_validado)
-    total_incons = len(df_inconsistencias)
-    total_com_data = int((df_validado["Data"].astype(str).str.strip() != "").sum()) if not df_validado.empty else 0
-
-    k1, k2, k3 = st.columns(3)
-
-    with k1:
-        st.markdown(f"""
-        <div class="kpi">
-            <div class="kpi-title">Dias na tabela</div>
-            <div class="kpi-value">{total_linhas}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with k2:
-        st.markdown(f"""
-        <div class="kpi">
-            <div class="kpi-title">Dias com data preenchida</div>
-            <div class="kpi-value">{total_com_data}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with k3:
-        st.markdown(f"""
-        <div class="kpi">
-            <div class="kpi-title">Horários sem par</div>
-            <div class="kpi-value">{total_incons}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # =========================
-    # OCR BRUTO
-    # =========================
     with st.expander("Visualizar OCR bruto"):
         st.text(st.session_state.raw_text[:5000] if st.session_state.raw_text else "")
 
-    # =========================
-    # GRADE EDITÁVEL
-    # =========================
-    st.subheader("Tabela final para revisão")
+    st.subheader("Tabela para revisão")
 
     df_exibicao = validar_pares(st.session_state.df_editado)
 
-    gb = GridOptionsBuilder.from_dataframe(df_exibicao)
-    gb.configure_default_column(editable=True, resizable=True, filter=True, sortable=True)
-
-    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
-
-    gb.configure_column("Inconsistência", editable=False)
-    gb.configure_column("Horários sem par", editable=False)
-    gb.configure_column("Data", minWidth=120)
-
-    for col in COLUNAS_MODELO[1:]:
-        gb.configure_column(col, minWidth=95)
-
-    gb.configure_grid_options(
-        rowHeight=34,
-        headerHeight=38,
-        animateRows=False
+    selecao = st.multiselect(
+        "Marque os números das linhas que deseja excluir",
+        options=list(range(len(df_exibicao))),
+        default=st.session_state.linhas_excluir,
+        format_func=lambda x: f"Linha {x + 1} - {df_exibicao.iloc[x]['Data'] if x < len(df_exibicao) else ''}"
     )
+    st.session_state.linhas_excluir = selecao
 
-    grid_response = AgGrid(
+    edited_df = st.data_editor(
         df_exibicao,
-        gridOptions=gb.build(),
-        update_mode=GridUpdateMode.MODEL_CHANGED | GridUpdateMode.SELECTION_CHANGED,
-        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-        fit_columns_on_grid_load=False,
-        height=420,
-        allow_unsafe_jscode=False,
-        theme="streamlit"
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="editor_cartao_principal",
+        disabled=["Inconsistência", "Horários sem par"],
+        column_config={
+            "Data": st.column_config.TextColumn("Data", width="medium"),
+            "Entrada1": st.column_config.TextColumn("Entrada1"),
+            "Saída1": st.column_config.TextColumn("Saída1"),
+            "Entrada2": st.column_config.TextColumn("Entrada2"),
+            "Saída2": st.column_config.TextColumn("Saída2"),
+            "Entrada3": st.column_config.TextColumn("Entrada3"),
+            "Saída3": st.column_config.TextColumn("Saída3"),
+            "Entrada4": st.column_config.TextColumn("Entrada4"),
+            "Saída4": st.column_config.TextColumn("Saída4"),
+            "Entrada5": st.column_config.TextColumn("Entrada5"),
+            "Saída5": st.column_config.TextColumn("Saída5"),
+            "Entrada6": st.column_config.TextColumn("Entrada6"),
+            "Saída6": st.column_config.TextColumn("Saída6"),
+            "Inconsistência": st.column_config.TextColumn("Inconsistência", width="small"),
+            "Horários sem par": st.column_config.TextColumn("Horários sem par", width="large"),
+        }
     )
 
-    df_editado_novo = pd.DataFrame(grid_response["data"])
-    st.session_state.df_editado = preparar_df_para_exportacao(df_editado_novo)
+    st.session_state.df_editado = preparar_df_exportacao(pd.DataFrame(edited_df))
 
-    selecionadas = grid_response.get("selected_rows", [])
-    qtd_selecionadas = len(selecionadas) if selecionadas is not None else 0
-
-    col_x, col_y = st.columns([1, 4])
-
-    with col_x:
-        if st.button("🗑️ Excluir selecionadas", use_container_width=True, disabled=(qtd_selecionadas == 0)):
-            df_atual = pd.DataFrame(grid_response["data"]).copy()
-
-            if qtd_selecionadas > 0:
-                df_sel = pd.DataFrame(selecionadas).copy()
-
-                # garante comparação pelas colunas do modelo
-                cols_compare = [c for c in COLUNAS_MODELO if c in df_atual.columns and c in df_sel.columns]
-                if cols_compare:
-                    for c in cols_compare:
-                        df_atual[c] = df_atual[c].fillna("").astype(str)
-                        df_sel[c] = df_sel[c].fillna("").astype(str)
-
-                    idx_drop = []
-                    for _, row_sel in df_sel.iterrows():
-                        mask = pd.Series(True, index=df_atual.index)
-                        for c in cols_compare:
-                            mask &= (df_atual[c] == row_sel[c])
-                        encontrados = df_atual[mask]
-                        if not encontrados.empty:
-                            idx_drop.append(encontrados.index[0])
-
-                    df_atual = df_atual.drop(index=idx_drop).reset_index(drop=True)
-
-                st.session_state.df_editado = preparar_df_para_exportacao(df_atual)
-                st.rerun()
-
-    with col_y:
-        st.caption("Selecione uma ou mais linhas na caixa de seleção à esquerda para excluí-las.")
-
-    # =========================
-    # INCONSISTÊNCIAS
-    # =========================
     st.subheader("Validação de horários")
-
     df_inconsistencias = gerar_relatorio_inconsistencias(st.session_state.df_editado)
 
     if len(df_inconsistencias) > 0:
         st.error(f"Foram encontrados {len(df_inconsistencias)} horário(s) sem par.")
-
-        st.dataframe(
-            df_inconsistencias,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(df_inconsistencias, use_container_width=True, hide_index=True)
     else:
         st.success("Nenhum horário sem par encontrado.")
 
